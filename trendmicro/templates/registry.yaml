@@ -1,0 +1,371 @@
+{{- if .Values.registry.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-registry-config
+  labels:
+    service: registry
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+data:
+  config.yml: |-
+    version: 0.1
+    log:
+      fields:
+        service: registry
+      formatter: json
+    storage:
+      filesystem:
+        rootdirectory: /var/lib/registry
+      delete:
+        enabled: true
+    http:
+      addr: :5000
+      headers:
+        X-Content-Type-Options: [nosniff]
+    health:
+      storagedriver:
+        enabled: true
+        interval: 10s
+        threshold: 3
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-auth
+  labels:
+    service: registry
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+type: Opaque
+data:
+  {{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+  username: {{ .Values.registry.auth.username | toString | b64enc }}
+  password: {{ .Values.registry.auth.password | toString | b64enc }}
+  {{- end }}
+  haSharedSecret: {{ randAlphaNum 16 | b64enc | quote }}
+
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  labels:
+    service: registry
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    appVersion: {{ .Chart.AppVersion }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  # We set revisionHistoryLimit to 0 because rollback should be done
+  # using `helm rollback` rather than with `kubectl rollout undo`, so
+  # we don't need to keep the old `ReplicaSet`s around.
+  # https://kubernetes.io/docs/concepts/workloads/controllers/deployment
+  revisionHistoryLimit: 0
+  replicas: {{ default 1 .Values.replicas.registry }}
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      service: registry
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        service: registry
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+        appVersion: {{ .Chart.AppVersion }}
+  {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+  {{- end }}
+    spec:
+      automountServiceAccountToken: false
+{{- $securityContextEnabled := .Values.securityContext.enabled }}
+{{- $securityContext := default .Values.securityContext.default .Values.securityContext.registry }}
+{{- $podSecurityContext := default .Values.securityContext.default.pod $securityContext.pod }}
+{{- $containerSecurityContext := default .Values.securityContext.default.container $securityContext.container }}
+{{- if $securityContextEnabled }}
+      securityContext:
+{{ toYaml $podSecurityContext | indent 8 }}
+{{- end }}
+      {{- $imageDefaults := .Values.images.defaults }}
+      {{- with .Values.images.registry }}
+      {{- $secret := (default (default "" $imageDefaults.imagePullSecret) .imagePullSecret) }}
+      {{- if not (eq "" $secret) }}
+      imagePullSecrets:
+        - name: {{ $secret | quote }}
+      {{- end }}
+      containers:
+      - name: registry
+{{- if $securityContextEnabled }}
+        securityContext:
+{{ toYaml $containerSecurityContext | indent 10 }}
+{{- end }}
+        {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+        {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+        {{- $tag := (default $imageDefaults.tag .tag) }}
+        image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+        imagePullPolicy: {{ default (default "IfNotPresent" $imageDefaults.pullPolicy) .pullPolicy }}
+        {{- end }}
+        command:
+          - /entrypoint.sh
+          - /bin/registry
+          - serve
+          - /etc/docker/registry/config.yml
+        ports:
+          - containerPort: 5000
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /
+            port: 5000
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /
+            port: 5000
+        resources:
+{{ toYaml (default .Values.resources.defaults .Values.resources.registry) | indent 12 }}
+        env:
+{{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+          - name: REGISTRY_AUTH
+            value: "htpasswd"
+          - name: REGISTRY_AUTH_HTPASSWD_REALM
+            value: "Registry Realm"
+          - name: REGISTRY_AUTH_HTPASSWD_PATH
+            value: "/auth/htpasswd"
+{{- end }}
+          - name: REGISTRY_HTTP_TLS_CERTIFICATE
+            value: /etc/ssl/docker/tls.crt
+          - name: REGISTRY_HTTP_TLS_KEY
+            value: /etc/ssl/docker/tls.key
+          - name: REGISTRY_HTTP_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: registry-auth
+                key: haSharedSecret
+          - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+            value: "/var/lib/registry"
+          - name: REGISTRY_STORAGE_DELETE_ENABLED
+            value: "true"
+        volumeMounts:
+{{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+          - name: htpasswd
+            mountPath: /auth
+            readOnly: true
+{{- end }}
+          - mountPath: /etc/ssl/docker
+            name: tls-secret
+            readOnly: true
+          - name: data
+            mountPath: /var/lib/registry/
+          - name: registry-config
+            mountPath: /etc/docker/registry
+
+{{- if .Values.tasks.registryCleaner.enabled }}
+      - name: garbage-collector
+        {{- with .Values.images.registry }}
+        {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+        {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+        {{- $tag := (default $imageDefaults.tag .tag) }}
+        image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+        imagePullPolicy: {{ default (default "IfNotPresent" $imageDefaults.pullPolicy) .pullPolicy }}
+        {{- end }}
+        command: ["/bin/sh", "-c"]
+        args: ["while true; ./entrypoint.sh /bin/registry garbage-collect /etc/docker/registry/config.yml || true; do sleep 3600; done"]
+        env:
+          - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+            value: "/var/lib/registry"
+          - name: REGISTRY_STORAGE_DELETE_ENABLED
+            value: "true"
+        volumeMounts:
+          - name: data
+            mountPath: /var/lib/registry/
+          - name: registry-config
+            mountPath: /etc/docker/registry
+        {{- if $securityContextEnabled }}
+        securityContext: {{ toYaml $containerSecurityContext | nindent 10 }}
+        {{- end }}{{/* if $securityContextEnabled*/}}
+        resources: {{ toYaml (default .Values.resources.defaults .Values.resources.registryGarbageCollector) | nindent 10 }}
+
+      - name: cleaner
+        {{- with .Values.images.registryCleaner }}
+        {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+        {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+        {{- $tag := (default $imageDefaults.tag .tag) }}
+        image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+        imagePullPolicy: {{ default (default "Always" $imageDefaults.pullPolicy) .pullPolicy }}
+        {{- end }}
+        {{- if $securityContextEnabled }}
+        securityContext: {{ toYaml $containerSecurityContext | nindent 10 }}
+        {{- end }}{{/* if $securityContextEnabled */}}
+        resources: {{ toYaml (default .Values.resources.defaults .Values.resources.registryCleaner) | nindent 10 }}
+        args:
+          - purge-local
+{{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+          - --username=$(HTPASSWD_SECRET_USERNAME)
+          - --password=$(HTPASSWD_SECRET_PASSWORD)
+        env:
+          - name: HTPASSWD_SECRET_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: registry-auth
+                key: username
+          - name: HTPASSWD_SECRET_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: registry-auth
+                key: password
+{{- end }}
+        volumeMounts:
+          - name: data
+            mountPath: /var/lib/registry/
+            readOnly: true
+          - mountPath: /etc/ssl/docker
+            name: tls-secret
+            readOnly: true
+{{- end }}
+
+{{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+      initContainers:
+      {{- $imageDefaults := .Values.images.defaults }}
+      {{- with .Values.images.registry }}
+      - name: htpasswd
+        {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+        {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+        {{- $tag := (default $imageDefaults.tag .tag) }}
+        image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+        imagePullPolicy: {{ default (default "IfNotPresent" $imageDefaults.pullPolicy) .pullPolicy }}
+        {{- end }}
+        env:
+          - name: USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: registry-auth
+                key: username
+          - name: PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: registry-auth
+                key: password
+        command:
+        - /bin/sh
+        - -c
+        - ./entrypoint.sh htpasswd -Bbc /auth/htpasswd "$USERNAME" "$PASSWORD"
+        volumeMounts:
+        - name: htpasswd
+          mountPath: "/auth"
+        - name: empty-tmp
+          mountPath: "/tmp"
+        resources: {{ toYaml (default .Values.resources.defaults .Values.resources.htPasswd) | nindent 10 }}
+        {{- if $securityContextEnabled }}
+        securityContext: {{ toYaml $containerSecurityContext | nindent 10 }}
+        {{- end }}{{/* if $securityContextEnabled */}}
+{{- end }}
+
+      nodeSelector:
+{{ toYaml (default .Values.nodeSelector.defaults .Values.nodeSelector.registry) | indent 8 }}
+      tolerations:
+{{ toYaml (default .Values.tolerations.defaults .Values.tolerations.registry) | indent 8 }}
+      volumes:
+        - name: empty-tmp
+          emptyDir: {}
+{{- if (and .Values.registry.auth.username .Values.registry.auth.password) }}
+        - name: htpasswd
+          emptyDir:
+            sizeLimit: 1Mi
+{{- end }}
+        - name: data
+          emptyDir:
+            sizeLimit: {{ default "10Gi" .Values.registry.dataVolume.sizeLimit | quote }}
+        - name: registry-config
+          configMap:
+            name: {{ template "smartcheck.fullname" . }}-registry-config
+        - name: tls-secret
+          secret:
+            secretName: {{ required "certificate.secret.name is required when enabling pre-registry scanning. See https://github.com/deep-security/smartcheck-helm/wiki/Replace-the-service-certificate for instructions on replacing the default certificate." .Values.certificate.secret.name }}
+            items:
+              - key: {{ default "tls.crt" .Values.certificate.secret.certificate }}
+                path: tls.crt
+              - key: {{ default "tls.key" .Values.certificate.secret.privateKey }}
+                path: tls.key
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  labels:
+    service: registry
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5000
+      protocol: TCP
+      name: registry
+      targetPort: 5000
+  selector:
+    service: registry
+    release: {{ .Release.Name }}
+
+{{ if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: registry
+  labels:
+    service: registry
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      service: registry
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+{{- end }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              service: proxy
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 5000
+
+    - from: # any -- this should just be kubelet for health probes
+      ports:
+        - protocol: TCP
+          port: 8083
+{{- end }}
+
+{{- end -}}

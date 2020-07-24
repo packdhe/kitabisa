@@ -1,0 +1,306 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: image-scan-internal
+  labels:
+    service: image-scan-internal
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}{{/* range .Values.extraLabels */}}
+spec:
+  ports:
+    - port: 8081
+      protocol: TCP
+      name: internal
+  selector:
+    service: image-scan
+    release: {{ .Release.Name }}
+---
+{{ include "smartcheck.service.database.secret" (dict "Chart" .Chart "Values" .Values "Release" .Release "service" "openscapscan") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-scan
+  labels:
+    service: image-scan
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    appVersion: {{ .Chart.AppVersion }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}{{/* range .Values.extraLabels */}}
+spec:
+  # We set revisionHistoryLimit to 0 because rollback should be done
+  # using `helm rollback` rather than with `kubectl rollout undo`, so
+  # we don't need to keep the old `ReplicaSet`s around.
+  # https://kubernetes.io/docs/concepts/workloads/controllers/deployment
+  revisionHistoryLimit: 0
+  replicas: {{ default 1 .Values.replicas.imageScan }}
+  selector:
+    matchLabels:
+      service: image-scan
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        service: image-scan
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+        appVersion: {{ .Chart.AppVersion }}
+        {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+        {{ $k }}: {{ quote $v }}
+        {{- end }}{{/* range .Values.extraLabels */}}
+    spec:
+      automountServiceAccountToken: false
+      {{- $securityContextEnabled := .Values.securityContext.enabled }}
+      {{- $securityContext := default .Values.securityContext.default .Values.securityContext.imageScan }}
+      {{- if $securityContextEnabled }}
+      securityContext: {{ toYaml (default .Values.securityContext.default.pod $securityContext.pod) | nindent 8 }}
+      {{- end }}{{/* if $securityContextEnabled */}}
+      initContainers:
+        - {{ include "smartcheck.db-initcontainer" (dict "Values" .Values "Chart" .Chart "Release" .Release "service" "openscapscan") | nindent 10 | trim }}
+
+      {{- $secret := (default (default "" .Values.images.defaults.imagePullSecret) .Values.images.imageScan.imagePullSecret) }}
+      {{- if $secret }}
+      imagePullSecrets:
+        - name: {{ $secret | quote }}
+      {{- end }}{{/* if $secret */}}
+      containers:
+        - name: sca-scan
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml (default .Values.securityContext.default.container $securityContext.scaScanContainer) | nindent 12 }}
+          {{- end }}{{/* if $securityContextEnabled */}}
+          {{ include "image" (dict "defaults" .Values.images.defaults "image" .Values.images.scaScan) | nindent 10 }}
+          ports:
+            - containerPort: 3001
+              name: sca-scan
+            - containerPort: 3002
+              name: sca-health
+          args:
+            - --bind-port=3001
+            - --feed-dir=/data
+            - --root=work/
+            {{- if .Values.telemetry.enabled }}
+            - --telemetry-endpoint=http://metrics-internal:8081
+            {{- end }}
+          env:
+            {{- include "smartcheck.activation-code.env" . | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+              readOnly: true
+            - name: sca-feed-data
+              mountPath: /data
+              readOnly: true
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.scaScan) | nindent 12 }}
+
+        - name: sca-feed-consumer
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml (default .Values.securityContext.default.container $securityContext.scaFeedConsumerContainer) | nindent 12 }}
+          {{- end }}{{/* if $securityContextEnabled */}}
+          {{ include "image" (dict "defaults" .Values.images.defaults "image" .Values.images.scaFeedConsumer) | nindent 10 }}
+          args:
+            {{- if hasKey .Values "feed" }}
+            {{- if hasKey .Values.feed "sca" }}
+            {{- if hasKey .Values.feed.sca "url" }}
+            - --feed-url={{ .Values.feed.sca.url }}
+            {{- end }}{{/* if hasKey .values.feed.sca "url" */}}
+            {{- if hasKey .Values.feed.sca "interval" }}
+            - --every={{ .Values.feed.sca.interval }}
+            {{- end }}{{/* if hasKey .values.feed.sca "interval" */}}
+            {{- end }}{{/* if hasKey .Values.feed "sca" */}}
+            {{- end }}{{/* if hasKey .Values "feed" */}}
+            - --feed-dir=/data
+          env:
+            {{- include "smartcheck.proxy.env" . | nindent 12 }}
+            {{- include "smartcheck.activation-code.env" . | nindent 12 }}
+          volumeMounts:
+            - name: sca-feed-data
+              mountPath: /data
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.scaFeedConsumer) | nindent 12 }}
+
+        - name: openscap-scan
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml (default .Values.securityContext.default.container $securityContext.openscapScanContainer) | nindent 12 }}
+          {{- end }}{{/* if $securityContextEnabled */}}
+          {{ include "image" (dict "defaults" .Values.images.defaults "image" .Values.images.openscapScan) | nindent 10 }}
+          ports:
+            - containerPort: 3011
+              name: openscap-scan
+          args:
+            - --bind-port=3011
+            - --oval-file=/data/oval.xml
+            - --checklist-dir=/data
+            - --root=work/
+          volumeMounts:
+            - name: oscap-temp
+              mountPath: /tmp
+            - name: work
+              mountPath: /work
+            - name: oscap-feed-data
+              mountPath: /data
+              readOnly: true
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.openscapScan) | nindent 12 }}
+        - name: image-scan
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml (default .Values.securityContext.default.container $securityContext.imageScanContainer) | nindent 12 }}
+          {{- end }}{{/* if $securityContextEnabled */}}
+          {{ include "image" (dict "defaults" .Values.images.defaults "image" .Values.images.imageScan) | nindent 10 }}
+          ports:
+            - containerPort: 8081
+              name: internal
+            - containerPort: 8083
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          args:
+            - --internal-base=http://image-scan-internal:8081
+            - --authorization-url=http://auth-internal:8081
+            - --database-connection-string=postgres:postgres://
+            - --database-secret=$(DB_SECRET)
+            - --scanner-url=http://localhost:3011/api/scans
+            - --scanner-url=http://localhost:3001/api/scans
+          env:
+            {{- include "smartcheck.service.database.env" (dict "Chart" .Chart "Release" .Release "Values" .Values "service" "openscapscan") | nindent 12 }}
+            {{- include "smartcheck.proxy.env" . | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            {{- include "smartcheck.db-trust-volume-mount" . | nindent 12 }}
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.imageScan) | nindent 12 }}
+
+        - name: openscap-feed-consumer
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml (default .Values.securityContext.default.container $securityContext.feedConsumerContainer) | nindent 12 }}
+          {{- end }}{{/* if $securityContextEnabled */}}
+          {{ include "image" (dict "defaults" .Values.images.defaults "image" .Values.images.openscapFeedConsumer) | nindent 10 }}
+          ports:
+            - containerPort: 8083
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          args:
+            - sync
+            {{- if hasKey .Values "feed" }}
+            {{- if hasKey .Values.feed "openscap" }}
+            {{- if hasKey .Values.feed.openscap "url" }}
+            - --feed-url={{ .Values.feed.openscap.url }}
+            {{- end }}{{/* if hasKey .values.feed.openscap "url" */}}
+            {{- if hasKey .Values.feed.openscap "interval" }}
+            - --every={{ .Values.feed.openscap.interval }}
+            {{- end }}{{/* if hasKey .values.feed.openscap "interval" */}}
+            {{- end }}{{/* if hasKey .Values.feed "openscap" */}}
+            {{- end }}{{/* if hasKey .Values "feed" */}}
+            - --authorization-token=$(ACTIVATION_CODE)
+            - --initial-oval-file=/initial-oval.xml
+            - --initial-checklists-directory=/initial-checklists
+          env:
+            {{- include "smartcheck.proxy.env" . | nindent 12 }}
+            {{- include "smartcheck.activation-code.env" . | nindent 12 }}
+          volumeMounts:
+            - name: oscap-feed-data
+              mountPath: /data
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.openscapFeedConsumer) | nindent 12 }}
+      nodeSelector: {{ toYaml (default .Values.nodeSelector.defaults .Values.nodeSelector.imageScan) | nindent 8 }}
+      tolerations: {{ toYaml (default .Values.tolerations.defaults .Values.tolerations.imageScan) | nindent 8 }}
+      restartPolicy: Always
+      volumes:
+        - name: oscap-temp
+          emptyDir: {}
+        - name: oscap-feed-data
+          emptyDir:
+            sizeLimit: {{ default "1Gi" .Values.scan.openscap.dataVolume.sizeLimit | quote }}
+        - name: sca-feed-data
+          emptyDir:
+            sizeLimit: {{ default "1Gi" .Values.scan.sca.dataVolume.sizeLimit | quote }}
+        - name: work
+          emptyDir:
+            sizeLimit: {{ default "5Gi" .Values.scan.openscap.workVolume.sizeLimit | quote }}
+        {{- include "smartcheck.db-trust-volume" . | nindent 8 }}
+
+{{ if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: image-scan
+  labels:
+    service: image-scan
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}{{/* range .Values.extraLabels */}}
+spec:
+  podSelector:
+    matchLabels:
+      service: image-scan
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+      {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+      {{- end }}{{/* range .Values.extraLabels */}}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            service: scan
+            release: {{ .Release.Name }}
+            heritage: {{ .Release.Service }}
+            {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+            {{ $k }}: {{ quote $v }}
+            {{- end }}{{/* range .Values.extraLabels */}}
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from: # any -- this is for metrics
+      ports:
+        - protocol: TCP
+          port: 8082
+    - from: # any -- this should just be kubelet for health probes
+      ports:
+        - protocol: TCP
+          port: 8083
+  egress:
+    {{- include "smartcheck.to-dns-networkpolicy" . | nindent 4 }}
+    {{- include "smartcheck.to-db-networkpolicy" . | nindent 4 }}
+    {{- include "smartcheck.to-internal-service-networkpolicy" (dict "Release" .Release "Values" .Values "services" (list "scan" "metrics")) | nindent 4 }}
+    # allow egress for feed consumer
+    - to: # any
+      ports:
+      - protocol: TCP
+        port: 80
+      - protocol: TCP
+        port: 443
+    {{- include "smartcheck.networkpolicy.outbound" . | nindent 4 }}
+{{- end }}{{/* if .Values.networkPolicy.enabled */}}
