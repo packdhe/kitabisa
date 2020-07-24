@@ -1,0 +1,12 @@
+## activationCode is the product activation code.
+##
+## Default value: (none)
+activationCode: YOUR-CODE-HERE
+
+auth:
+  ## secretSeed is used as part of the password generation process for
+  ## all auto-generated internal passwords, ensuring that each installation of
+  ## Deep Security Smart Check has different passwords.
+  ##
+  ## Default value: {must be provided by the installer}
+  secretSeed: YOUR-SECRET-HERE
