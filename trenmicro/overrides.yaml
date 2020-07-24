@@ -1,0 +1,41 @@
+## activationCode is the product activation code.
+##
+## Default value: (none)
+activationCode: DK-P9FR-ENNVW-X55U2-NBW8T-6LMG8-RVPLD
+
+auth:
+  ## secretSeed is used as part of the password generation process for
+  ## all auto-generated internal passwords, ensuring that each installation of
+  ## Deep Security Smart Check has different passwords.
+  ##
+  ## Default value: {must be provided by the installer}
+  secretSeed: P@ssw0rd
+persistence:
+  ## enabled is whether a persistent volume claim should be created for database storage.
+  ## If no persistent volume claim is created, then the database will be lost every time the
+  ## database container restarts.
+  enabled: true
+
+  ## storageClassName is the name of the storage class that should be used for persistent volumes.
+  ## If no value is specified, then `storageClassName` is left out of the persistent volume claim.
+  ## This value can be overridden for each persistent volume; see below.
+  ##
+  ## Reference: https://kubernetes.io/docs/concepts/storage/persistent-volumes/#class
+  ##
+  ## Default: blank
+  storageClassName: longhorn
+
+  db:
+    ## size is the amount of persistent volume storage to request for the main application databases.
+    ##
+    ## Default value: 8Gi
+    size: 8Gi #?
+
+    ## storageClassName is the name of the storage class that should be used for persistent volume
+    ## used by the application database. If no value is specified, then the value of
+    ## `persistence.storageClassName` is used.
+    ##
+    ## Reference: https://kubernetes.io/docs/concepts/storage/persistent-volumes/#class
+    ##
+    ## Default: blank
+    storageClassName: longhorn
