@@ -1,6 +1,6 @@
 apiVersion: apps/v1
-    kind: Deployment
-    metadata:
+kind: Deployment
+metadata:
       name: weave-scope-cluster-agent
       annotations:
         cloud.weave.works/launcher-info: |-
@@ -17,7 +17,7 @@ apiVersion: apps/v1
         weave-cloud-component: scope
         weave-scope-component: cluster-agent
       namespace: weave
-    spec:
+spec:
       replicas: 1
       revisionHistoryLimit: 2
       template:
