@@ -3,26 +3,26 @@ kind: Ingress
 metadata:
   annotations:
     kubernetes.io/ingress.class: nginx
-    certmanager.k8s.io/cluster-issuer: letsencrypt-http-prod
-    #nginx.ingress.kubernetes.io/auth-type: basic
+ #   certmanager.k8s.io/cluster-issuer: letsencrypt-http-prod
+ #   #nginx.ingress.kubernetes.io/auth-type: basic
     #nginx.ingress.kubernetes.io/auth-secret: link-auth
     #nginx.ingress.kubernetes.io/auth-realm: 'Authentication Required'
-    nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
-    nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$request_uri"
+#    nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
+ #   nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$request_uri"
     #nginx.ingress.kubernetes.io/auth-url: "http://weave-oauth2-proxy.oauth2-proxy.svc.cluster.local:4180/oauth2/auth"
     #nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$request_uri"
   name: weave-scope
   namespace: weave
 spec:
   rules:
-  - host: infra.yourpay.co.id
+  - host: infra.vm.local
     http:
       paths:
       - backend:
           serviceName: weave-scope-app
           servicePort: 80
         path: /
-  tls:
-  - hosts:
-    - infra.yourpay.co.id
-    secretName: infra-yourpay-tls
+#  tls:
+#  - hosts:
+#    - infra.yourpay.co.id
+#    secretName: infra-yourpay-tls
