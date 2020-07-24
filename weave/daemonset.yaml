@@ -1,6 +1,6 @@
 apiVersion: extensions/v1
-    kind: DaemonSet
-    metadata:
+kind: DaemonSet
+metadata:
       name: weave-scope-agent
       annotations:
         cloud.weave.works/launcher-info: |-
@@ -17,7 +17,7 @@ apiVersion: extensions/v1
         weave-cloud-component: scope
         weave-scope-component: agent
       namespace: weave
-    spec:
+spec:
       minReadySeconds: 5
       template:
         metadata:
