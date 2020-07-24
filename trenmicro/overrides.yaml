@@ -1,7 +1,7 @@
 ## activationCode is the product activation code.
 ##
 ## Default value: (none)
-activationCode: YOUR-CODE-HERE
+activationCode: DK-P9FR-ENNVW-X55U2-NBW8T-6LMG8-RVPLD
 
 auth:
   ## secretSeed is used as part of the password generation process for
@@ -9,4 +9,4 @@ auth:
   ## Deep Security Smart Check has different passwords.
   ##
   ## Default value: {must be provided by the installer}
-  secretSeed: YOUR-SECRET-HERE
+  secretSeed: P@ssw0rd
