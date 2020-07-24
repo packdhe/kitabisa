@@ -1,0 +1,710 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+  annotations:
+    {{ toYaml .Values.service.annotations | indent 4 | trim }}
+  labels:
+    service: proxy
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  type: {{ default "LoadBalancer" .Values.service.type }}
+  ports:
+    - port: {{ default 443 .Values.service.httpsPort }}
+      targetPort: 8443
+      protocol: TCP
+      name: https
+    - port: {{ default 80 .Values.service.httpPort }}
+      targetPort: 8080
+      protocol: TCP
+      name: http
+{{ if .Values.registry.enabled }}
+    - port: {{ default 5000 .Values.service.registryPort }}
+      targetPort: 5000
+      protocol: TCP
+      name: registryhttps
+{{- end }}
+
+  {{- if .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+  {{- range $cidr := .Values.service.loadBalancerSourceRanges }}
+  - {{ $cidr | quote }}
+  {{- end }}
+  {{- end }}
+
+  selector:
+    service: proxy
+    release: {{ .Release.Name }}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  labels:
+    service: proxy
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    appVersion: {{ .Chart.AppVersion }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  # We set revisionHistoryLimit to 0 because rollback should be done
+  # using `helm rollback` rather than with `kubectl rollout undo`, so
+  # we don't need to keep the old `ReplicaSet`s around.
+  # https://kubernetes.io/docs/concepts/workloads/controllers/deployment
+  revisionHistoryLimit: 0
+  replicas: {{ default 1 .Values.replicas.proxy }}
+  selector:
+    matchLabels:
+      service: proxy
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        service: proxy
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+        appVersion: {{ .Chart.AppVersion }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+        {{ $k }}: {{ quote $v }}
+{{- end }}
+    spec:
+      automountServiceAccountToken: false
+{{- $securityContextEnabled := .Values.securityContext.enabled }}
+{{- $securityContext := default .Values.securityContext.default .Values.securityContext.proxy }}
+{{- $podSecurityContext := default .Values.securityContext.default.pod $securityContext.pod }}
+{{- $containerSecurityContext := default .Values.securityContext.default.container $securityContext.container }}
+{{- if $securityContextEnabled }}
+      securityContext:
+{{ toYaml $podSecurityContext | indent 8 }}
+{{- end }}
+      {{- $imageDefaults := .Values.images.defaults }}
+      {{- with .Values.images.proxy }}
+      {{- $secret := (default (default "" $imageDefaults.imagePullSecret) .imagePullSecret) }}
+      {{- if not (eq "" $secret) }}
+      imagePullSecrets:
+        - name: {{ $secret | quote }}
+      {{- end }}
+      containers:
+        - name: proxy
+{{- if $securityContextEnabled }}
+          securityContext:
+{{ toYaml $containerSecurityContext | indent 12 }}
+{{- end }}
+          {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+          {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+          {{- $tag := (default $imageDefaults.tag .tag) }}
+          image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+          imagePullPolicy: {{ default (default "Always" $imageDefaults.pullPolicy) .pullPolicy }}
+          {{- end }}
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8443
+              name: https
+{{- if .Values.registry.enabled }}
+            - containerPort: 5000
+              name: registryhttps
+{{- end }}
+          volumeMounts:
+            - mountPath: /var/run
+              name: varrun
+            - mountPath: /var/cache/nginx
+              name: varcache
+            - mountPath: /secrets
+              name: tls-secret
+            - mountPath: /etc/nginx/dssc
+              name: config
+          # TODO probes
+          # livenessProbe:
+          # readinessProbe:
+          command:
+          - nginx
+          - -g daemon off;
+          # this looks wrong but with a space we get
+          # nginx: [emerg] open() "/etc/nginx/ dssc/nginx.conf" failed (2: No such file or directory)
+          - -cdssc/nginx.conf
+          env: []
+          resources:
+{{ toYaml (default .Values.resources.defaults .Values.resources.proxy) | indent 12 }}
+      volumes:
+        - name: varrun
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: varcache
+          emptyDir:
+            sizeLimit: 10Mi
+        - name: tls-secret
+          secret:
+{{- if not .Values.certificate.secret.name }}
+            secretName: {{ template "smartcheck.fullname" . }}-tls-certificate
+            items:
+              - key: certificate
+                path: default_ssl.crt
+              - key: privateKey
+                path: default_ssl.key
+{{- else }}
+            secretName: {{ .Values.certificate.secret.name }}
+            items:
+              - key: {{ default "tls.crt" .Values.certificate.secret.certificate }}
+                path: default_ssl.crt
+              - key: {{ default "tls.key" .Values.certificate.secret.privateKey }}
+                path: default_ssl.key
+{{- end }}
+        - name: config
+          configMap:
+            name: {{ template "smartcheck.fullname" . }}-proxy
+            items:
+              - key: proxy.conf
+                path: nginx.conf
+      nodeSelector:
+{{ toYaml (default .Values.nodeSelector.defaults .Values.nodeSelector.proxy) | indent 8 }}
+      tolerations:
+{{ toYaml (default .Values.tolerations.defaults .Values.tolerations.proxy) | indent 8 }}
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-proxy
+  labels:
+    service: {{ template "smartcheck.fullname" . }}-proxy
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+data:
+  proxy.conf: |
+    # Derived from https://github.com/h5bp/server-configs-nginx/blob/master/doc/getting-started.md
+    #
+    # Configuration File - Nginx Server Configs
+    # http://nginx.org/en/docs/dirindex.html
+
+    # Run as a unique, less privileged user for security reasons.
+    # Default: nobody nobody
+
+    # Sets the worker threads to the number of CPU cores available in the system for best performance.
+    # Should be > the number of CPU cores.
+    # Maximum number of connections = worker_processes * worker_connections
+    # Default: 1
+    worker_processes auto;
+
+    # Maximum number of open files per worker process.
+    # Should be > worker_connections.
+    # Default: no limit
+    worker_rlimit_nofile 8192;
+
+    events {
+      # If you need more connections than this, you start optimizing your OS.
+      # That's probably the point at which you hire people who are smarter than you as this is *a lot* of requests.
+      # Should be < worker_rlimit_nofile.
+      # Default: 512
+      worker_connections 8000;
+    }
+
+    # Log errors and warnings to this file
+    # This is only used when you don't override it on a server{} level
+    # Default: logs/error.log error
+    # The upstream nginx container creates sym links to stdout/stderr
+    # https://github.com/nginxinc/docker-nginx/blob/8921999083def7ba43a06fabd5f80e4406651353/mainline/jessie/Dockerfile#L21-L23
+    error_log /var/log/nginx/error.log error;
+
+    # The file storing the process ID of the main process
+    # Default: nginx.pid
+    pid        /var/run/nginx.pid;
+
+    http {
+
+      # Hide nginx version information.
+      # Default: on
+      server_tokens off;
+
+      # Specify MIME types for files.
+      include       ../mime.types;
+
+      # Default: text/plain
+      default_type  application/octet-stream;
+
+      # Update charset_types to match updated mime.types.
+      # text/html is always included by charset module.
+      # Default: text/html text/xml text/plain text/vnd.wap.wml application/javascript application/rss+xml
+      charset_types
+        text/css
+        text/plain
+        text/vnd.wap.wml
+        application/javascript
+        application/json
+        application/rss+xml
+        application/xml;
+
+      # Include $http_x_forwarded_for within default format used in log files
+      log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+
+      # For log field reference see https://nginx.org/en/docs/http/ngx_http_log_module.html
+      # For more variables see https://nginx.org/en/docs/varindex.html
+      log_format json_log escape=json
+        '{'
+          '"component": "proxy", '
+          '"dur": "${request_time}s", '
+          '"referer": "$http_referer", '
+          '"userAgent": "$http_user_agent", '
+          '"forwardedFor": "$http_x_forwarded_for", '
+          '"len": "$body_bytes_sent", '
+          '"method": "$request_method", '
+          '"proto": "$server_protocol", '
+          '"remoteAddr": "$remote_addr", '
+          '"requestID": "$sent_http_x_request_id", '
+          '"response": $status, '
+          '"severity": "info", '
+          '"timestamp": "$time_iso8601", '
+          '"uri": "$request_uri" '
+        '}';
+
+      # Log access to this file
+      # This is only used when you don't override it on a server{} level
+      # Default: logs/access.log combined
+      # The upstream nginx container creates sym links to stdout/stderr
+      # https://github.com/nginxinc/docker-nginx/blob/8921999083def7ba43a06fabd5f80e4406651353/mainline/jessie/Dockerfile#L21-L23
+      access_log /var/log/nginx/access.log json_log;
+
+      # How long to allow each connection to stay idle.
+      # Longer values are better for each individual client, particularly for SSL,
+      # but means that worker connections are tied up longer.
+      # Default: 75s
+      keepalive_timeout 20s;
+
+      # Speed up file transfers by using sendfile() to copy directly
+      # between descriptors rather than using read()/write().
+      # For performance reasons, on FreeBSD systems w/ ZFS
+      # this option should be disabled as ZFS's ARC caches
+      # frequently used files in RAM by default.
+      # Default: off
+      sendfile        on;
+
+      # Don't send out partial frames; this increases throughput
+      # since TCP frames are filled up before being sent out.
+      # Default: off
+      tcp_nopush      on;
+
+      # Enable gzip compression.
+      # Default: off
+      gzip on;
+
+      # Compression level (1-9).
+      # 5 is a perfect compromise between size and CPU usage, offering about
+      # 75% reduction for most ASCII files (almost identical to level 9).
+      # Default: 1
+      gzip_comp_level    5;
+
+      # Don't compress anything that's already small and unlikely to shrink much
+      # if at all (the default is 20 bytes, which is bad as that usually leads to
+      # larger files after gzipping).
+      # Default: 20
+      gzip_min_length    256;
+
+      # Compress data even for clients that are connecting to us via proxies,
+      # identified by the "Via" header (required for CloudFront).
+      # Default: off
+      gzip_proxied       any;
+
+      # Tell proxies to cache both the gzipped and regular version of a resource
+      # whenever the client's Accept-Encoding capabilities header varies;
+      # Avoids the issue where a non-gzip capable client (which is extremely rare
+      # today) would display gibberish if their proxy gave them the gzipped version.
+      # Default: off
+      gzip_vary          on;
+
+      # Compress all output labeled with one of the following MIME-types.
+      # text/html is always compressed by gzip module.
+      # Default: text/html
+      gzip_types
+        application/atom+xml
+        application/javascript
+        application/json
+        application/ld+json
+        application/manifest+json
+        application/rss+xml
+        application/vnd.geo+json
+        application/vnd.ms-fontobject
+        application/x-font-ttf
+        application/x-web-app-manifest+json
+        application/xhtml+xml
+        application/xml
+        font/opentype
+        image/bmp
+        image/svg+xml
+        image/x-icon
+        text/cache-manifest
+        text/css
+        text/plain
+        text/vcard
+        text/vnd.rim.location.xloc
+        text/vtt
+        text/x-component
+        text/x-cross-domain-policy;
+
+      # redirect all http traffic to https
+      server {
+        listen 8080;
+        {{- if .Values.ipv6.enabled }}
+        listen [::]:8080;
+        {{- end }}
+        server_name _;
+        return 301 https://$host$request_uri;
+      }
+
+      {{ $apiRateLimiting := default (dict) (default (dict) .Values.rateLimiting).api -}}
+      #
+      # Code generated by helm. DO NOT EDIT.
+      #
+      limit_req_zone $binary_remote_addr zone=limit:{{ default 10 $apiRateLimiting.size }}m rate={{ default 10 $apiRateLimiting.rate }}r/s;
+
+      # List of application servers
+      upstream frontend_server {
+        server frontend:8080;
+      }
+      upstream scan_server {
+        server scan:8080;
+      }
+      upstream auth_server {
+        server auth:8080;
+      }
+      upstream docs_server {
+        server docs:8080;
+      }
+      upstream registryviews_server {
+        server registryviews:8080;
+      }
+      upstream license_server {
+        server license:8080;
+      }
+
+      # Configuration for the server
+      server {
+        # Running port
+        {{- if .Values.ipv6.enabled }}
+        listen [::]:8443 ssl http2 default_server;
+        {{- end }}
+        listen 8443 ssl http2 default_server;
+
+        include ../ssl/ssl.conf;
+
+        charset utf-8;
+
+        error_page 401 /401.json;
+        location = /401.json {
+          root /etc/nginx/custom_errors;
+          internal;
+        }
+
+        # Proxying the connections
+        location / {
+          proxy_pass         http://frontend_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+          add_header         Strict-Transport-Security "max-age=31622400";
+        }
+
+        location /api {
+          # Short-circuit requests that don't have an authorization token.
+          if ($http_authorization !~ "^Bearer") {
+            return 401;
+          }
+
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://scan_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+        }
+
+        location /docs/ {
+          proxy_pass         http://docs_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+          add_header         Strict-Transport-Security "max-age=31622400";
+        }
+
+        location ~ /saml/?$ {
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://auth_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+
+          add_header         Vary "Authorization" always;
+        }
+
+        location ~ /api/sessions {
+          # don't check for the Authorization header here because they won't
+          # have a token until they create the session
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://auth_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+        }
+
+        location ~ /api/(users|roles|identity-providers) {
+          # Short-circuit requests that don't have an authorization token.
+          if ($http_authorization !~ "^Bearer") {
+            return 401;
+          }
+
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://auth_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+        }
+
+        location ~ /api/registries {
+          # Short-circuit requests that don't have an authorization token.
+          if ($http_authorization !~ "^Bearer") {
+            return 401;
+          }
+
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://registryviews_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+
+          add_header         Vary "Authorization" always;
+        }
+
+        location ~ /api/license {
+          # Short-circuit requests that don't have an authorization token.
+          if ($http_authorization !~ "^Bearer") {
+            return 401;
+          }
+
+          limit_req zone=limit burst={{ default 10 $apiRateLimiting.burst }};
+          limit_req_status {{ default 429 $apiRateLimiting.status }};
+
+          proxy_pass         http://license_server;
+
+          add_header         Vary "Authorization" always;
+        }
+      }
+
+      {{ if .Values.registry.enabled }}
+
+      upstream registry_server {
+        server registry:5000;
+      }
+
+      # Configuration for the registry
+      server {
+
+        # Running port
+        {{- if .Values.ipv6.enabled }}
+        listen [::]:5000 ssl http2 default_server;
+        {{- end }}
+        listen 5000 ssl http2 default_server;
+
+        include ../ssl/ssl.conf;
+
+        charset utf-8;
+
+        # disable any limits to avoid HTTP 413 for large image uploads
+        client_max_body_size 0;
+
+        # required to avoid HTTP 411: see Issue #1486 (https://github.com/moby/moby/issues/1486)
+        chunked_transfer_encoding on;
+
+        # required to avoid HTTP 405 Not allowed.
+        location / {
+          proxy_set_header   Host $http_host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+          proxy_set_header   X-Forwarded-Proto $scheme;
+          proxy_read_timeout 900;
+
+          add_header         Vary "Authorization" always;
+          add_header         Strict-Transport-Security "max-age=31622400";
+        }
+
+        location /v2/ {
+
+          # Do not allow connections from docker 1.5 and earlier
+          # docker pre-1.6.0 did not properly set the user agent on ping, catch "Go *" user agents
+          if ($http_user_agent ~ "^(docker\/1\.(3|4|5(?!\.[0-9]-dev))|Go ).*$" ) {
+            return 404;
+          }
+
+          proxy_pass         https://registry_server;
+          proxy_redirect     off;
+          proxy_set_header   Host $http_host;
+          proxy_set_header   X-Real-IP $remote_addr;
+          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header   X-Forwarded-Host $server_name;
+          proxy_set_header   X-Forwarded-Proto $scheme;
+          proxy_read_timeout 900;
+
+          add_header         Vary "Authorization" always;
+          add_header         Strict-Transport-Security "max-age=31622400";
+        }
+      }
+      {{- end }}{{/* if .Values.registry.enabled */}}
+    }
+
+{{ if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proxy
+  labels:
+    service: proxy
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      service: proxy
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+{{- end }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from: # any
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from: # any
+      ports:
+        - protocol: TCP
+          port: 8443
+{{ if .Values.registry.enabled }}
+    - from: # any
+      ports:
+        - protocol: TCP
+          port: 5000
+{{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              service: frontend
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+              service: scan
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+              service: registryviews
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+              service: auth
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+              service: docs
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+              service: license
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{ if .Values.registry.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              service: registry
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 5000
+{{- end }}
+    - to: # any
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+{{- end }}

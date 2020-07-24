@@ -1,0 +1,118 @@
+{{ if .Values.tasks.scan.enabled }}
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: scan
+  labels:
+    task: scan
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    appVersion: {{ .Chart.AppVersion }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  startingDeadlineSeconds: 300
+  concurrencyPolicy: Replace
+  schedule: {{ quote .Values.tasks.scan.schedule }}
+  successfulJobsHistoryLimit: 0
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            task: scan
+            release: {{ .Release.Name }}
+            heritage: {{ .Release.Service }}
+            appVersion: {{ .Chart.AppVersion }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+            {{ $k }}: {{ quote $v }}
+{{- end }}
+        spec:
+          automountServiceAccountToken: false
+{{- $securityContextEnabled := .Values.securityContext.enabled }}
+{{- $securityContext := default .Values.securityContext.default .Values.securityContext.tasks }}
+{{- $podSecurityContext := default .Values.securityContext.default.pod $securityContext.pod }}
+{{- $containerSecurityContext := default .Values.securityContext.default.container $securityContext.container }}
+{{- if $securityContextEnabled }}
+          securityContext:
+{{ toYaml $podSecurityContext | indent 12 }}
+{{- end }}
+          {{- $imageDefaults := .Values.images.defaults }}
+          {{- with .Values.images.tasks }}
+          {{- $secret := (default (default "" $imageDefaults.imagePullSecret) .imagePullSecret) }}
+          {{- if not (eq "" $secret) }}
+          imagePullSecrets:
+            - name: {{ $secret | quote }}
+          {{- end }}
+          containers:
+            - name: tasks
+{{- if $securityContextEnabled }}
+              securityContext:
+{{ toYaml $containerSecurityContext | indent 16 }}
+{{- end }}
+              {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+              {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+              {{- $tag := (default $imageDefaults.tag .tag) }}
+              image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+              imagePullPolicy: {{ default (default "Always" $imageDefaults.pullPolicy) .pullPolicy }}
+              {{- end }}
+              args:
+                - scan
+              resources:
+{{ toYaml (default .Values.resources.defaults .Values.resources.tasks) | indent 16 }}
+          restartPolicy: OnFailure
+          nodeSelector:
+{{ toYaml (default .Values.nodeSelector.defaults .Values.nodeSelector.tasks) | indent 12 }}
+          tolerations:
+{{ toYaml (default .Values.tolerations.defaults .Values.tolerations.tasks) | indent 12 }}
+{{ end }}
+
+{{ if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tasks
+  labels:
+    task: scan
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      task: scan
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+{{- end }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      ports:
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              service: registryviews
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 8081
+    - to: # any
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+{{- end }}

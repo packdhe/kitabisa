@@ -1,0 +1,316 @@
+{{ if (and .Values.tasks.metricsCollector.enabled .Values.tasks.metricsReporter.enabled) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics
+  labels:
+    service: metrics
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+spec:
+  ports:
+    - name: metrics
+      port: 8082
+      protocol: TCP
+      targetPort: 8082
+  selector:
+    metrics: include
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+  type: ClusterIP
+  clusterIP: None
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-internal
+  labels:
+    service: metrics
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+{{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+{{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      protocol: TCP
+      targetPort: 8081
+      name: metrics
+  selector:
+    service: metrics
+    release: {{ .Release.Name }}
+---
+{{ include "smartcheck.service.database.secret" (dict "Chart" .Chart "Values" .Values "Release" .Release "service" "metrics") }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-metrics
+  labels:
+    app: {{ template "smartcheck.name" . }}
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+type: Opaque
+data:
+  apiKey: {{ default "" .Values.telemetry.apiKey | b64enc | quote }}
+  publicKey: {{ default "" .Values.telemetry.publicKey | b64enc | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics
+  labels:
+    service: metrics
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    appVersion: {{ .Chart.AppVersion }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+spec:
+  # We set revisionHistoryLimit to 0 because rollback should be done
+  # using `helm rollback` rather than with `kubectl rollout undo`, so
+  # we don't need to keep the old `ReplicaSet`s around.
+  # https://kubernetes.io/docs/concepts/workloads/controllers/deployment
+  revisionHistoryLimit: 0
+  # Intentionally don't want to support multiple replicas here
+  replicas: 1
+  selector:
+    matchLabels:
+      service: metrics
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        service: metrics
+        release: {{ .Release.Name }}
+        heritage: {{ .Release.Service }}
+        appVersion: {{ .Chart.AppVersion }}
+        {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+        {{ $k }}: {{ quote $v }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ template "smartcheck.fullname" . }}-metrics-collector
+      automountServiceAccountToken: true
+      {{- $securityContextEnabled := .Values.securityContext.enabled }}
+      {{- $securityContext := default .Values.securityContext.default .Values.securityContext.metricsCollector }}
+      {{- $podSecurityContext := default .Values.securityContext.default.pod $securityContext.pod }}
+      {{- $containerSecurityContext := default .Values.securityContext.default.container $securityContext.container }}
+      {{- if $securityContextEnabled }}
+      securityContext: {{ toYaml $podSecurityContext | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - {{ include "smartcheck.db-initcontainer" (dict "Values" .Values "Chart" .Chart "Release" .Release "service" "metrics") | nindent 10 | trim }}
+
+      {{- $imageDefaults := .Values.images.defaults }}
+      {{- with .Values.images.metrics }}
+      {{- $secret := (default (default "" $imageDefaults.imagePullSecret) .imagePullSecret) }}
+      {{- if not (eq "" $secret) }}
+      imagePullSecrets:
+        - name: {{ $secret | quote }}
+      {{- end }}
+      containers:
+        - name: metrics
+          {{- if $securityContextEnabled }}
+          securityContext: {{ toYaml $containerSecurityContext | nindent 12 }}
+          {{- end }}
+          {{- $project := (default (default "deepsecurity" $imageDefaults.project) .project) }}
+          {{- $repository := printf "%s/%s" $project (required ".repository is required!" .repository) }}
+          {{- $tag := (default $imageDefaults.tag .tag) }}
+          image: {{ include "image.source" (dict "repository" $repository "registry" .registry "tag" $tag "imageDefaults" $imageDefaults "digest" .digest) }}
+          imagePullPolicy: {{ default (default "Always" $imageDefaults.pullPolicy) .pullPolicy }}
+          {{- end }}
+          args:
+            - run
+            - --namespace={{ .Release.Namespace }}
+            - --metrics-service=metrics
+            - --metrics-directory=/data/metrics
+            - --activation-code=$(ACTIVATION_CODE)
+            - --application-name=ZA
+            - --product-code=DK
+            - --service=ALL
+            - --report-format=DSSC
+            - --report-format-version=1.0
+            - --target-url=$(TARGET_URL)
+            - --metrics-directory=/data/metrics
+            - --application-version=$(APPLICATION_VERSION)
+            - --license-url=http://license-internal:8081
+            - --flush
+            {{- if .Values.telemetry.enabled }}
+            - --telemetry-endpoint={{ .Values.telemetry.endpoint }}
+            - --telemetry-interval={{ .Values.telemetry.interval }}
+            - --telemetry-api-key={{ default "" .Values.telemetry.apiKey }}
+            {{- if .Values.telemetry.publicKey }}
+            - --telemetry-key-file=/telemetry/key.pem
+            {{- end }}{{/* .Values.telemetry.publicKey */}}
+            {{- end }}{{/* .Values.telemetry.enabled */}}
+          env:
+            - name: APPLICATION_VERSION
+              value: {{ .Chart.Version | quote }}
+            - name: TARGET_URL
+              value: {{ .Values.tasks.metricsReporter.url }}
+            {{- include "smartcheck.service.database.env" (dict "Chart" .Chart "Release" .Release "Values" .Values "service" "metrics") | nindent 12 }}
+            {{- include "smartcheck.activation-code.env" . | nindent 12 }}
+            {{- include "smartcheck.proxy.env" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{ include "smartcheck.db-trust-volume-mount" . | nindent 12 }}
+            {{- if .Values.telemetry.publicKey }}
+            - name: telemetry-secret
+              mountPath: /telemetry
+            {{- end }}{{/* .Values.telemetry.publicKey */}}
+          resources: {{ toYaml (default .Values.resources.defaults .Values.resources.metrics) | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir: {}
+        {{- if .Values.telemetry.publicKey }}
+        - name: telemetry-secret
+          secret:
+            secretName: {{ template "smartcheck.fullname" . }}-metrics
+            items:
+            - key: publicKey
+              path: key.pem
+        {{- end }}{{/* .Values.telemetry.publicKey */}}
+        {{- include "smartcheck.db-trust-volume" . | nindent 8 }}
+      restartPolicy: Always
+      nodeSelector: {{ toYaml (default .Values.nodeSelector.defaults .Values.nodeSelector.metrics) | nindent 8 }}
+      tolerations: {{ toYaml (default .Values.tolerations.defaults .Values.tolerations.metrics) | nindent 8 }}
+{{ if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: metrics
+  labels:
+    service: metrics
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      service: metrics
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+      {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+      {{ $k }}: {{ quote $v }}
+      {{- end }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # Allow any pod in the application to send telemetry events
+        - podSelector:
+            matchLabels:
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+              {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8081
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              service: license
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+              {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8081
+    - to:
+        - podSelector:
+            matchLabels:
+              metrics: include
+              release: {{ .Release.Name }}
+              heritage: {{ .Release.Service }}
+              {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+              {{ $k }}: {{ quote $v }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8082
+    - to: # any
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    {{- include "smartcheck.to-dns-networkpolicy" . | nindent 4 }}
+    {{- include "smartcheck.to-db-networkpolicy" . | nindent 4 }}
+    {{- include "smartcheck.networkpolicy.outbound" . | nindent 4 }}
+{{- end }}{{/* if .Values.networkPolicy.enabled */}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-metrics-collector
+  labels:
+    task: metrics-collector
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-metrics-collector-role
+  labels:
+    task: metrics-collector
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ template "smartcheck.fullname" . }}-metrics-collector-role-binding
+  labels:
+    task: metrics-collector
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+    {{- range $k, $v := (default (dict) .Values.extraLabels) }}
+    {{ $k }}: {{ quote $v }}
+    {{- end }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ template "smartcheck.fullname" . }}-metrics-collector
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ template "smartcheck.fullname" . }}-metrics-collector-role
+  apiGroup: rbac.authorization.k8s.io
+
+{{ end }}{{/* if (and .Values.tasks.metricsCollector.enabled .Values.tasks.metricsReporter.enabled) */}}
