@@ -4,7 +4,7 @@
 ## activationCode is the product activation code.
 ##
 ## Default value: (none)
-activationCode:
+activationCode:DK-P9FR-ENNVW-X55U2-NBW8T-6LMG8-RVPLD
 
 ## extraLabels is a dictionary of additional labels that will be added to all resources
 ## created by this chart.
@@ -94,7 +94,7 @@ auth:
   ## Deep Security Smart Check has different passwords.
   ##
   ## Default value: {must be provided by the installer}
-  secretSeed:
+  secretSeed:P@ssw0rd
 
   saml:
     ## enabled controls whether SAML authentication will be enabled.
